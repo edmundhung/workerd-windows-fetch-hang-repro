@@ -1,0 +1,11 @@
+{
+	"name": "workerd-windows-fetch-hang-repro",
+	"private": true,
+	"type": "module",
+	"scripts": {
+		"test": "node repro.mjs"
+	},
+	"devDependencies": {
+		"workerd": "1.20261112.1"
+	}
+}
