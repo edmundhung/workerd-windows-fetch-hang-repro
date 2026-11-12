@@ -1,27 +1,17 @@
-// Kills an upstream workerd process while a proxy workerd process has a
-// fetch() to it in flight, and reports how long that fetch() takes to settle.
+// Shows how workerd's fetch() behaves when its upstream goes away while a
+// request is in flight, in four scenarios (see README.md).
 //
-// "reused connection": the in-flight request goes out on a keep-alive
-// connection that already served a response.
-// "fresh connection": the in-flight request is the connection's first.
-//
-// Exits with code 1 if the proxy's fetch() does not settle within
-// SETTLE_LIMIT_MS of the upstream being killed.
+// Exits with code 1 if any scenario differs from workerd 1.20261110.1.
 
 import { execFileSync, spawn } from "node:child_process";
 import { once } from "node:events";
+import { createServer as createHttpServer } from "node:http";
 import { createServer } from "node:net";
 import { setTimeout as sleep } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 import workerd from "workerd";
 
 const workerdPath = workerd.default;
-const SETTLE_LIMIT_MS = Number(process.env.SETTLE_LIMIT_MS ?? 10_000);
-const WAIT_LIMIT_MS = Number(process.env.WAIT_LIMIT_MS ?? 60_000);
-
-function configPath(name) {
-	return fileURLToPath(new URL(name, import.meta.url));
-}
 
 async function getFreePort() {
 	const server = createServer();
@@ -37,7 +27,12 @@ async function startWorkerd(config) {
 	const port = await getFreePort();
 	const child = spawn(
 		workerdPath,
-		["serve", configPath(config), "--socket-addr", `http=127.0.0.1:${port}`],
+		[
+			"serve",
+			fileURLToPath(new URL(config, import.meta.url)),
+			"--socket-addr",
+			`http=127.0.0.1:${port}`,
+		],
 		{ stdio: ["ignore", "inherit", "inherit"] }
 	);
 	const exited = once(child, "exit");
@@ -46,8 +41,7 @@ async function startWorkerd(config) {
 	const deadline = Date.now() + 10_000;
 	for (;;) {
 		try {
-			const response = await fetch(url);
-			await response.text();
+			await (await fetch(url)).text();
 			break;
 		} catch (error) {
 			if (Date.now() > deadline) {
@@ -56,68 +50,116 @@ async function startWorkerd(config) {
 			await sleep(100);
 		}
 	}
-	return { child, exited, url };
+	return {
+		url,
+		async stop() {
+			child.kill("SIGKILL");
+			await exited;
+		},
+	};
 }
 
-async function runScenario(name, reuseConnection) {
+/** Asks the proxy Worker to fetch() `target` and returns what it reports. */
+async function viaProxy(proxy, target) {
+	const response = await fetch(
+		`${proxy.url}/?target=${encodeURIComponent(target)}`
+	);
+	return response.text();
+}
+
+/**
+ * Kills the upstream workerd process while the proxy's fetch() to it is in
+ * flight, and times how long that fetch() takes to reject.
+ */
+async function killUpstream({ reuseConnection }) {
 	const upstream = await startWorkerd("upstream.capnp");
 	const proxy = await startWorkerd("proxy.capnp");
-	const viaProxy = (path) =>
-		`${proxy.url}/?target=${encodeURIComponent(upstream.url + path)}`;
-
 	try {
 		if (reuseConnection) {
 			// Leaves a keep-alive connection in the proxy's pool.
-			const response = await fetch(viaProxy("/short"));
-			console.log(`  warm-up: ${await response.text()}`);
+			await viaProxy(proxy, `${upstream.url}/short`);
 		}
-
-		const inflight = fetch(viaProxy("/long")).then(
-			async (response) => response.text(),
-			(error) => `request to proxy failed: ${error}`
-		);
+		const inflight = viaProxy(proxy, `${upstream.url}/long`);
 		await sleep(1_000);
 
-		upstream.child.kill("SIGKILL");
-		await upstream.exited;
+		await upstream.stop();
 		const killedAt = Date.now();
-		console.log("  upstream killed");
-
-		const result = await Promise.race([
-			inflight,
-			sleep(WAIT_LIMIT_MS).then(() => undefined),
-		]);
+		const reply = await inflight;
 		const elapsed = Date.now() - killedAt;
-		const passed = result !== undefined && elapsed <= SETTLE_LIMIT_MS;
-		console.log(
-			result === undefined
-				? `  proxy fetch() still pending ${elapsed}ms after the kill`
-				: `  proxy says: ${result}`
-		);
-		return { scenario: name, settledAfterKillMs: elapsed, passed };
+		return {
+			scenario: `upstream killed, ${reuseConnection ? "reused" : "fresh"} connection`,
+			result: `rejected ${elapsed}ms after the kill`,
+			ok: reply.startsWith("fetch rejected") && elapsed < 1_000,
+		};
 	} finally {
-		proxy.child.kill("SIGKILL");
-		await proxy.exited;
+		await proxy.stop();
+	}
+}
+
+/** Times a fetch() to a port that nothing listens on. */
+async function nothingListening() {
+	const proxy = await startWorkerd("proxy.capnp");
+	try {
+		const start = Date.now();
+		const reply = await viaProxy(proxy, `http://127.0.0.1:${await getFreePort()}/`);
+		return {
+			scenario: "nothing listening on the port",
+			result: `rejected after ${Date.now() - start}ms`,
+			// Informational: shows how long this OS takes to refuse a connection.
+			ok: reply.startsWith("fetch rejected"),
+		};
+	} finally {
+		await proxy.stop();
+	}
+}
+
+/**
+ * Uses a Node.js upstream that resets the connection while it holds /long,
+ * and counts how many times /long reaches it.
+ */
+async function resetMidRequest() {
+	let longRequests = 0;
+	const upstream = createHttpServer((request, response) => {
+		if (request.url === "/long") {
+			longRequests++;
+			setTimeout(() => request.socket.resetAndDestroy(), 500);
+			return;
+		}
+		response.end("short");
+	});
+	upstream.listen(0, "127.0.0.1");
+	await once(upstream, "listening");
+	const upstreamUrl = `http://127.0.0.1:${upstream.address().port}`;
+
+	const proxy = await startWorkerd("proxy.capnp");
+	try {
+		// Leaves a keep-alive connection in the proxy's pool.
+		await viaProxy(proxy, `${upstreamUrl}/short`);
+		const reply = await viaProxy(proxy, `${upstreamUrl}/long`);
+		return {
+			scenario: "upstream resets a reused connection mid-request",
+			result: `/long reached the upstream ${longRequests} time(s)`,
+			ok: reply.startsWith("fetch rejected") && longRequests === 1,
+		};
+	} finally {
+		await proxy.stop();
+		upstream.closeAllConnections();
+		upstream.close();
 	}
 }
 
 const version = execFileSync(workerdPath, ["--version"]).toString().trim();
-console.log(`${version} on ${process.platform}/${process.arch}\n`);
+console.log(`${version} on ${process.platform}/${process.arch}`);
 
-const results = [];
-for (const [name, reuse] of [
-	["fresh connection", false],
-	["reused connection", true],
-]) {
-	console.log(`${name}:`);
-	results.push(await runScenario(name, reuse));
-	console.log();
-}
+const results = [
+	await killUpstream({ reuseConnection: false }),
+	await killUpstream({ reuseConnection: true }),
+	await nothingListening(),
+	await resetMidRequest(),
+];
 console.table(results);
 
-if (results.some((result) => !result.passed)) {
-	console.error(
-		`FAIL: the proxy's fetch() did not settle within ${SETTLE_LIMIT_MS}ms of the upstream being killed`
-	);
+if (results.some((result) => !result.ok)) {
+	console.error("FAIL: behaviour differs from workerd 1.20261110.1");
 	process.exit(1);
 }
